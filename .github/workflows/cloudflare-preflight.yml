@@ -34,7 +34,8 @@ jobs:
             const body = await response.json();
             if (!response.ok || !body.success) {
               const codes = (body.errors ?? []).flatMap(error => [error.code, ...(error.error_chain ?? []).map(item => item.code)]);
-              throw new Error(`${method} ${path.replace(/[a-f0-9]{32}/g, '<id>')} failed (HTTP ${response.status}, codes: ${codes.join(', ')})`);
+              const detail = (body.errors ?? []).map(error => String(error.message ?? '').replace(/[a-f0-9]{32}/gi, '<id>')).join('; ');
+              throw new Error(`${method} ${path.replace(/[a-f0-9]{32}/g, '<id>')} failed (HTTP ${response.status}, codes: ${codes.join(', ')}): ${detail}`);
             }
             return body.result;
           }
@@ -80,7 +81,7 @@ jobs:
                 throw new Error('Existing MX records point to another mail service');
               }
               if (rule.enabled && !targetsVeil(rule)) throw new Error('A different Catch-all rule is already enabled');
-              if (!settings.enabled) await api(`${path}/dns`, 'POST', { name: zone.name });
+              if (!settings.enabled) await api(`${path}/dns`, 'POST');
               if (!rule.enabled) {
                 await api(catchAllPath, 'PUT', {
                   name: 'Veil', enabled: true, matchers: [{ type: 'all' }],
