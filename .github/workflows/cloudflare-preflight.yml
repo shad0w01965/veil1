@@ -1,0 +1,60 @@
+name: Inspect Cloudflare deployment prerequisites
+on:
+  push:
+    branches: [veil-cloudflare-preflight]
+permissions: {}
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect account and email routing
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { resolveMx } from 'node:dns/promises';
+          const token = process.env.CF_TOKEN?.trim();
+          if (!token) throw new Error('Set a Cloudflare API token as a repository secret');
+          async function api(path) {
+            const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+              headers: { Authorization: `Bearer ${token}` },
+              signal: AbortSignal.timeout(15000),
+            });
+            const body = await response.json();
+            const errors = (body.errors ?? []).flatMap(error => [error.code, ...(error.error_chain ?? []).map(item => item.code)]);
+            return { ok: response.ok && body.success, status: response.status, errors, result: body.result, total: body.result_info?.total_count };
+          }
+          const selectedAccount = process.env.CF_ACCOUNT?.trim();
+          if (selectedAccount && !/^[a-f0-9]{32}$/i.test(selectedAccount)) throw new Error('Invalid Cloudflare Account ID');
+          const zones = await api(`/zones?per_page=50${selectedAccount ? `&account.id=${selectedAccount}` : ''}`);
+          if (!zones.ok) console.log('Zone list unavailable', zones.status, zones.errors);
+          const accountIds = [...new Set((zones.result ?? []).map(zone => zone.account.id))];
+          let account = selectedAccount || (accountIds.length === 1 ? accountIds[0] : '');
+          if (!account && accountIds.length === 0) {
+            const accounts = await api('/accounts?per_page=5');
+            console.log('Account list', accounts.status, accounts.errors, 'count:', accounts.total ?? accounts.result?.length);
+            if (accounts.ok && accounts.result?.length === 1 && (accounts.total ?? 1) === 1) account = accounts.result[0].id;
+          }
+          console.log('Unique account identified:', Boolean(account));
+          if (account) {
+            const workers = await api(`/accounts/${account}/workers/scripts`);
+            console.log('Worker lookup', workers.status, workers.errors, 'veil exists:', workers.result?.some(worker => worker.id === 'veil'));
+          }
+          if (!zones.ok || !account) process.exitCode = 1;
+          if (zones.total > 50) throw new Error('More than one page of zones');
+          for (const zone of zones.result ?? []) {
+            if (account && zone.account.id !== account) continue;
+            const [routing, catchAll, mx] = await Promise.all([
+              api(`/zones/${zone.id}/email/routing`),
+              api(`/zones/${zone.id}/email/routing/rules/catch_all`),
+              resolveMx(zone.name).then(records => records.map(record => record.exchange)).catch(error => error.code),
+            ]);
+            console.log(JSON.stringify({
+              domain: zone.name, zoneStatus: zone.status, mx,
+              routing: { status: routing.status, errors: routing.errors, enabled: routing.result?.enabled, state: routing.result?.status },
+              catchAll: { status: catchAll.status, errors: catchAll.errors, enabled: catchAll.result?.enabled, actions: catchAll.result?.actions?.map(action => action.type) },
+            }));
+          }
+          NODE
