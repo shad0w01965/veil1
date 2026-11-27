@@ -1,0 +1,53 @@
+name: Configure Veil public API key
+on:
+  push:
+    branches: [veil-cloudflare-preflight]
+    paths: ['.github/workflows/veil-public-api-key.yml']
+permissions: {}
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Configure Worker secret
+        env:
+          CF_CREDENTIAL: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VEIL_KEY: ${{ secrets.VEIL_PUBLIC_API_KEY }}
+        run: |
+          node --input-type=module <<'NODE'
+          const raw = process.env.CF_CREDENTIAL.trim();
+          const token = /^[A-Za-z0-9_-]{35,128}$/.test(raw) ? raw :
+            raw.match(/\bAuthorization\s*:\s*Bearer\s+([A-Za-z0-9_-]{35,128})(?=["'\s]|$)/i)?.[1] ??
+            raw.match(/(?:^|\n)\s*(?:export\s+)?CLOUDFLARE_API_TOKEN\s*=\s*["']?([A-Za-z0-9_-]{35,128})(?=["'\s]|$)/)?.[1];
+          if (!token || !/^[a-f0-9]{64}$/.test(process.env.VEIL_KEY)) throw new Error('Required credentials missing');
+          console.log(`::add-mask::${token}`);
+          async function api(path, method = 'GET', body) {
+            const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+              method,
+              headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: body && JSON.stringify(body),
+              signal: AbortSignal.timeout(15000),
+            });
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(`Cloudflare API HTTP ${response.status}, codes: ${data.errors?.map(error => error.code).join(', ')}`);
+            return data.result;
+          }
+          let account = process.env.CF_ACCOUNT.trim() ||
+            raw.match(/api\.cloudflare\.com\/client\/v4\/accounts\/([a-f0-9]{32})\/tokens\/verify\b/i)?.[1] ||
+            raw.match(/(?:^|\n)\s*(?:export\s+)?CLOUDFLARE_ACCOUNT_ID\s*=\s*["']?([a-f0-9]{32})(?=["'\s]|$)/i)?.[1];
+          if (!account) {
+            const zones = await api('/zones?per_page=50');
+            const accounts = new Set(zones.map(zone => zone.account.id));
+            if (zones.length >= 50 || accounts.size !== 1) throw new Error('Could not determine Cloudflare account');
+            [account] = accounts;
+          }
+          if (!/^[a-f0-9]{32}$/i.test(account)) throw new Error('Invalid Cloudflare account ID');
+          const { subdomain } = await api(`/accounts/${account}/workers/subdomain`);
+          if (subdomain !== 'w7286476') throw new Error('Account does not match the deployed Veil Worker');
+          const secretsPath = `/accounts/${account}/workers/scripts/veil/secrets`;
+          const bindings = await api(secretsPath);
+          if (bindings.some(binding => binding.name === 'PUBLIC_API_KEY')) throw new Error('Worker already has a public API key');
+          await api(secretsPath, 'PUT', { name: 'PUBLIC_API_KEY', type: 'secret_text', text: process.env.VEIL_KEY });
+          console.log('Veil public API key configured');
+          NODE
