@@ -1,67 +1,98 @@
-name: Inspect Cloudflare deployment prerequisites
+name: Configure Veil email routing
 on:
   push:
     branches: [veil-cloudflare-preflight]
 permissions: {}
 jobs:
-  inspect:
+  configure:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Inspect account and email routing
+      - name: Enable and verify email routing
         env:
-          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE }}
+          CF_CREDENTIAL: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE }}
           CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VEIL_MAIL_DOMAINS: ${{ vars.VEIL_MAIL_DOMAINS }}
         run: |
           node --input-type=module <<'NODE'
           import { resolveMx } from 'node:dns/promises';
-          const raw = process.env.CF_TOKEN?.trim() ?? '';
-          const token = /^[A-Za-z0-9_-]{35,128}$/.test(raw) && !/^[A-Fa-f0-9]{32}$/.test(raw) ? raw :
+
+          const raw = process.env.CF_CREDENTIAL.trim();
+          const token = /^[A-Za-z0-9_-]{35,128}$/.test(raw) ? raw :
             raw.match(/\bAuthorization\s*:\s*Bearer\s+([A-Za-z0-9_-]{35,128})(?=["'\s]|$)/i)?.[1] ??
             raw.match(/(?:^|\n)\s*(?:export\s+)?CLOUDFLARE_API_TOKEN\s*=\s*["']?([A-Za-z0-9_-]{35,128})(?=["'\s]|$)/)?.[1];
-          if (!token) throw new Error('No Cloudflare API token found in the repository secret. Paste the token value shown after creating it.');
+          if (!token) throw new Error('Cloudflare API token missing or invalid');
           console.log(`::add-mask::${token}`);
-          const embeddedAccount = raw.match(/api\.cloudflare\.com\/client\/v4\/accounts\/([a-f0-9]{32})\/tokens\/verify\b/i)?.[1] ??
-            raw.match(/(?:^|\n)\s*(?:export\s+)?CLOUDFLARE_ACCOUNT_ID\s*=\s*["']?([a-f0-9]{32})(?=["'\s]|$)/i)?.[1];
-          if (embeddedAccount) console.log(`::add-mask::${embeddedAccount}`);
-          async function api(path) {
+
+          async function api(path, method = 'GET', data) {
             const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
-              headers: { Authorization: `Bearer ${token}` },
-              signal: AbortSignal.timeout(15000),
+              method,
+              headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: data === undefined ? undefined : JSON.stringify(data),
+              signal: AbortSignal.timeout(20000),
             });
             const body = await response.json();
-            const errors = (body.errors ?? []).flatMap(error => [error.code, ...(error.error_chain ?? []).map(item => item.code)]);
-            return { ok: response.ok && body.success, status: response.status, errors, result: body.result, total: body.result_info?.total_count };
+            if (!response.ok || !body.success) {
+              const codes = (body.errors ?? []).flatMap(error => [error.code, ...(error.error_chain ?? []).map(item => item.code)]);
+              throw new Error(`${method} ${path.replace(/[a-f0-9]{32}/g, '<id>')} failed (HTTP ${response.status}, codes: ${codes.join(', ')})`);
+            }
+            return body.result;
           }
-          const selectedAccount = process.env.CF_ACCOUNT?.trim() || embeddedAccount;
-          if (selectedAccount && !/^[a-f0-9]{32}$/i.test(selectedAccount)) throw new Error('Invalid Cloudflare Account ID');
-          const zones = await api(`/zones?per_page=50${selectedAccount ? `&account.id=${selectedAccount}` : ''}`);
-          if (!zones.ok) console.log('Zone list unavailable', zones.status, zones.errors);
-          const accountIds = [...new Set((zones.result ?? []).map(zone => zone.account.id))];
-          let account = selectedAccount || (accountIds.length === 1 ? accountIds[0] : '');
-          if (!account && accountIds.length === 0) {
-            const accounts = await api('/accounts?per_page=5');
-            console.log('Account list', accounts.status, accounts.errors, 'count:', accounts.total ?? accounts.result?.length);
-            if (accounts.ok && accounts.result?.length === 1 && (accounts.total ?? 1) === 1) account = accounts.result[0].id;
+
+          let account = process.env.CF_ACCOUNT.trim() ||
+            raw.match(/api\.cloudflare\.com\/client\/v4\/accounts\/([a-f0-9]{32})\/tokens\/verify\b/i)?.[1] ||
+            raw.match(/(?:^|\n)\s*(?:export\s+)?CLOUDFLARE_ACCOUNT_ID\s*=\s*["']?([a-f0-9]{32})(?=["'\s]|$)/i)?.[1];
+          if (account && !/^[a-f0-9]{32}$/i.test(account)) throw new Error('Invalid Cloudflare Account ID');
+          const zones = await api(`/zones?per_page=50${account ? `&account.id=${account}` : ''}`);
+          if (!account) {
+            const accounts = new Set(zones.map(zone => zone.account.id));
+            if (zones.length >= 50 || accounts.size !== 1) throw new Error('Set the CLOUDFLARE_ACCOUNT_ID secret');
+            [account] = accounts;
           }
-          console.log('Unique account identified:', Boolean(account));
-          if (account) {
-            const workers = await api(`/accounts/${account}/workers/scripts`);
-            console.log('Worker lookup', workers.status, workers.errors, 'veil exists:', workers.result?.some(worker => worker.id === 'veil'));
+          console.log(`::add-mask::${account}`);
+          const domains = process.env.VEIL_MAIL_DOMAINS.split(',').map(domain => domain.trim()).filter(Boolean);
+          if (domains.length !== 2 || new Set(domains).size !== 2) throw new Error('Expected two distinct receiving domains');
+          const selected = domains.map(domain => zones.find(zone => zone.name === domain && zone.status === 'active'));
+          if (selected.some(zone => !zone)) throw new Error('Missing active Cloudflare zone');
+
+          const { subdomain } = await api(`/accounts/${account}/workers/subdomain`);
+          if (!/^[a-z0-9-]+$/.test(subdomain)) throw new Error('Invalid workers.dev subdomain');
+          const healthResponse = await fetch(`https://veil.${subdomain}.workers.dev/api/health`, { signal: AbortSignal.timeout(15000) });
+          const health = await healthResponse.json();
+          if (!healthResponse.ok || !health.ok || health.service !== 'veil' ||
+              domains.some(domain => !health.config?.domains?.includes(domain))) {
+            throw new Error('Veil must be healthy with both receiving domains before routing is changed');
           }
-          if (!zones.ok || !account) process.exitCode = 1;
-          if (zones.total > 50) throw new Error('More than one page of zones');
-          for (const zone of zones.result ?? []) {
-            if (account && zone.account.id !== account) continue;
-            const [routing, catchAll, mx] = await Promise.all([
-              api(`/zones/${zone.id}/email/routing`),
-              api(`/zones/${zone.id}/email/routing/rules/catch_all`),
-              resolveMx(zone.name).then(records => records.map(record => record.exchange)).catch(error => error.code),
-            ]);
-            console.log(JSON.stringify({
-              domain: zone.name, zoneStatus: zone.status, mx,
-              routing: { status: routing.status, errors: routing.errors, enabled: routing.result?.enabled, state: routing.result?.status },
-              catchAll: { status: catchAll.status, errors: catchAll.errors, enabled: catchAll.result?.enabled, actions: catchAll.result?.actions?.map(action => action.type) },
-            }));
+
+          const targetsVeil = rule => rule.actions?.length === 1 && rule.actions[0].type === 'worker' && rule.actions[0].value?.[0] === 'veil';
+          for (const zone of selected) {
+            try {
+              const path = `/zones/${zone.id}/email/routing`;
+              const catchAllPath = `${path}/rules/catch_all`;
+              const [settings, rule, mx] = await Promise.all([
+                api(path), api(catchAllPath),
+                resolveMx(zone.name).catch(error => {
+                  if (error.code === 'ENODATA') return [];
+                  throw error;
+                }),
+              ]);
+              if (mx.some(record => !/^route[1-3]\.mx\.cloudflare\.net\.?$/i.test(record.exchange))) {
+                throw new Error('Existing MX records point to another mail service');
+              }
+              if (rule.enabled && !targetsVeil(rule)) throw new Error('A different Catch-all rule is already enabled');
+              if (!settings.enabled) await api(`${path}/dns`, 'POST', { name: zone.name });
+              if (!rule.enabled) {
+                await api(catchAllPath, 'PUT', {
+                  name: 'Veil', enabled: true, matchers: [{ type: 'all' }],
+                  actions: [{ type: 'worker', value: ['veil'] }],
+                });
+              }
+              const [currentRouting, currentRule] = await Promise.all([api(path), api(catchAllPath)]);
+              if (!currentRouting.enabled || !currentRule.enabled || !targetsVeil(currentRule)) throw new Error('Saved routing configuration did not verify');
+              console.log(`${zone.name} Email Routing enabled, state ${currentRouting.status}, Catch-all routed to veil`);
+            } catch (error) {
+              console.error(`${zone.name} ${error.message}`);
+              process.exitCode = 1;
+            }
           }
           NODE
