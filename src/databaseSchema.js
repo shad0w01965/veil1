@@ -132,11 +132,9 @@ export async function validateRequiredSchema(db) {
 
 
 export async function createSchemaTables(db) {
-  await db.exec(`PRAGMA foreign_keys = OFF;`);
   for (const sql of Object.values(CREATE_TABLE_SQL)) {
-    await db.exec(sql);
+    await db.prepare(sql).run();
   }
-  await db.exec(`PRAGMA foreign_keys = ON;`);
 }
 
 export async function createSchemaIndexes(db) {

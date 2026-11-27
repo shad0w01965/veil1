@@ -30,7 +30,6 @@ async function performFirstTimeSetup(db) {
   await ensureIntegritySchema(db);
   await validateRequiredSchema(db);
   await createSchemaIndexes(db);
-  await db.exec('PRAGMA foreign_keys = ON;');
 }
 
 async function hasRequiredTables(db) {
@@ -49,5 +48,4 @@ export async function setupDatabase(db) {
   await ensureIntegritySchema(db);
   await validateRequiredSchema(db);
   await createSchemaIndexes(db);
-  await db.exec('PRAGMA foreign_keys = ON;');
 }
