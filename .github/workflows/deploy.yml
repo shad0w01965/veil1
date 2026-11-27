@@ -1,0 +1,73 @@
+name: Deploy Veil to Cloudflare
+
+on:
+  workflow_dispatch:
+    inputs:
+      mail_domain:
+        description: Receive domain for the initial deployment. Leave empty for routine deployments.
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'wrangler.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veil-cloudflare-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          MAIL_DOMAIN: ${{ inputs.mail_domain }}
+          VEIL_ADMIN_PASSWORD: ${{ secrets.VEIL_ADMIN_PASSWORD }}
+        shell: bash
+        run: |
+          : "${CLOUDFLARE_API_TOKEN:?Set the CLOUDFLARE_API_TOKEN repository secret}"
+          : "${CLOUDFLARE_ACCOUNT_ID:?Set the CLOUDFLARE_ACCOUNT_ID repository secret}"
+          wrangler=(npx --yes wrangler@4.168.0)
+
+          if [[ -z "$MAIL_DOMAIN" ]]; then
+            "${wrangler[@]}" deploy
+            exit
+          fi
+
+          : "${VEIL_ADMIN_PASSWORD:?Set the VEIL_ADMIN_PASSWORD repository secret for the initial deployment}"
+          umask 077
+          secrets_file=$(mktemp "$RUNNER_TEMP/veil-secrets.XXXXXXXX")
+          trap 'rm -f "$secrets_file"' EXIT
+          node --input-type=module - "$secrets_file" <<'NODE'
+          import { randomBytes } from 'node:crypto';
+          import { writeFileSync } from 'node:fs';
+
+          const domain = process.env.MAIL_DOMAIN.trim().toLowerCase();
+          const labels = domain.split('.');
+          if (domain.length > 253 || labels.length < 2 ||
+              labels.some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
+            throw new Error('Enter a single receive domain, for example mail.example.com');
+          }
+
+          writeFileSync(process.argv[2], JSON.stringify({
+            MAIL_DOMAIN: domain,
+            ADMIN_PASSWORD: process.env.VEIL_ADMIN_PASSWORD,
+            JWT_TOKEN: randomBytes(32).toString('hex'),
+          }));
+          NODE
+          "${wrangler[@]}" deploy --secrets-file "$secrets_file"

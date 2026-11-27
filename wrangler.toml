@@ -3,6 +3,9 @@ main = "src/server.js"
 compatibility_date = "2024-01-01"
 keep_vars = true
 
+[secrets]
+required = ["MAIL_DOMAIN", "ADMIN_PASSWORD", "JWT_TOKEN"]
+
 # D1 database binding
 [[d1_databases]]
 binding = "TEMP_MAIL_DB"
